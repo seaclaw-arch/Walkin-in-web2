@@ -531,13 +531,26 @@
 
     <script>
     /**
-     * Walk-in Frozen & Chiller v2.1
+     * Walk-in Frozen & Chiller v2.0
      * Refactored with: Security hardening, mobile UX fixes, consistent dropdowns
      * Module pattern to avoid global pollution
      */
     const App = (function() {
         'use strict';
-        
+        const deepMerge = (target, ...sources) => {
+    if (!sources.length) return target;
+    const source = sources.shift();
+    if (Object.prototype.toString.call(source) === '[object Object]') {
+        for (const key in source) {
+            if (Object.prototype.toString.call(source[key]) === '[object Object]') {
+                target[key] = deepMerge(target[key] || {}, source[key]);
+            } else {
+                target[key] = source[key];
+            }
+        }
+    }
+    return deepMerge(target, ...sources);
+};
         // ==================== CONFIG ====================
         const CONFIG = {
             firebase: {
@@ -758,38 +771,6 @@
             saveToFirestore();
         }
         
-        async function saveToFirestore() {
-    if (state.isSaving) throw new Error('Sedang menyimpan, harap tunggu');
-    state.isSaving = true;
-    const docRef = db.collection('shared').doc('data');
-    try {
-        // 🛡️ Potong array transaksi agar dokumen tidak melebihi 1MB
-        state.appData.frozen.transactions = state.appData.frozen.transactions.slice(0, CONFIG.maxTransactions);
-        state.appData.chiller.transactions = state.appData.chiller.transactions.slice(0, CONFIG.maxTransactions);
-        
-        await db.runTransaction(async (transaction) => {
-            await transaction.get(docRef);
-            transaction.set(docRef, {
-                frozen: state.appData.frozen,
-                chiller: state.appData.chiller,
-                lastSync: firebase.firestore.FieldValue.serverTimestamp()
-            }, { merge: true });
-        });
-        
-        // ✅ FIX: Setelah berhasil simpan, biarkan onSnapshot yang update state
-        // Jangan langsung render, tunggu sync dari Firestore
-        return true;
-    } catch (err) {
-        console.error('❌ Transaction failed:', err);
-        // ✅ FIX: Jangan rollback manual, biarkan Firestore handle
-        if (err.code === 'aborted') {
-            showToast('⚠️ Data sedang diubah user lain. Refresh halaman.', 'critical');
-        }
-        throw err;
-    } finally {
-        state.isSaving = false;
-    }
-}
         
         // ✅ Fixed: Proper basket-section sync with error handling
         function syncBasketsWithSections(area) {
@@ -945,7 +926,86 @@
         txns.pop();
     }
 }
+        // ==================== SAVE QUEUE & ATOMIC MERGE ====================
+const saveQueue = [];
+let isProcessingSave = false;
+
+// 🔹 Helper: Gabungkan data server + lokal secara aman (menghindari overwrite nested)
+function mergeLocalToServer(serverData, localData) {
+    const result = { ...serverData };
+    for (const area of ['frozen', 'chiller']) {
+        if (!localData[area]) continue;
+        result[area] = result[area] || { sections: {}, baskets: {}, transactions: [] };
         
+        // Sections & Baskets: Merge by key (tidak menimpa yang tidak diubah)
+        result[area].sections = { ...(serverData[area]?.sections || {}), ...(localData[area].sections || {}) };
+        result[area].baskets  = { ...(serverData[area]?.baskets  || {}), ...(localData[area].baskets  || {}) };
+        
+        // Transactions: Gabungkan, hapus duplikat ID, batasi ukuran
+        const serverTx = serverData[area]?.transactions || [];
+        const localTx  = localData[area]?.transactions || [];
+        const allTx = [...localTx, ...serverTx];
+        const seen = new Set();
+        result[area].transactions = allTx
+            .filter(t => !seen.has(t.id) && seen.add(t.id))
+            .slice(0, CONFIG.maxTransactions);
+    }
+    return result;
+}
+
+// 🔹 Fungsi publik: Masukkan ke antrian
+async function saveToFirestore() {
+    return new Promise((resolve, reject) => {
+        saveQueue.push({ resolve, reject });
+        runSaveQueue();
+    });
+}
+
+// 🔹 Proses antrian secara berurutan + delay aman
+async function runSaveQueue() {
+    if (isProcessingSave || saveQueue.length === 0) return;
+    isProcessingSave = true;
+    state.isSaving = true; // Update status UI
+
+    try {
+        while (saveQueue.length > 0) {
+            const { resolve, reject } = saveQueue.shift();
+            try {
+                const docRef = db.collection('shared').doc('data');
+                
+                await db.runTransaction(async (transaction) => {
+                    // 1. Baca data TERBARU dari server (WAJIB di dalam transaksi)
+                    const docSnap = await transaction.get(docRef);
+                    const serverData = docSnap.exists ? docSnap.data() : {};
+
+                    // 2. Merge aman: server + perubahan lokal user ini
+                    const merged = mergeLocalToServer(serverData, state.appData);
+                    merged.lastSync = firebase.firestore.FieldValue.serverTimestamp();
+
+                    // 3. Simpan hasil merge (bukan overwrite total)
+                    transaction.set(docRef, merged);
+                });
+                
+                resolve(true);
+                
+                // ⏱️ Delay 800ms sesuai permintaan: memberi waktu Firestore sync ke semua client
+                // tanpa membloklik UI atau menumpuk transaksi
+                await new Promise(r => setTimeout(r, 800));
+                
+            } catch (err) {
+                console.error('❌ Save failed:', err);
+                reject(err);
+                if (err.code === 'aborted') {
+                    showToast('⚠️ Data sedang diubah user lain, mencoba ulang...', 'warning');
+                }
+            } finally {
+                state.isSaving = false;
+            }
+        }
+    } finally {
+        isProcessingSave = false;
+    }
+}
         // ==================== UI HELPERS ====================
         let toastTimer = null;
 
@@ -1404,9 +1464,10 @@ function showToast(message, type = 'normal') {
                         <input type="hidden" id="inBaris" value="${Utils.escapeHtml(target.baris)}">
                         <input type="hidden" id="inSlot" value="${target.slot}">
                         <input type="hidden" id="inKeranjangManual" value="${target.basketNum}">
-                        <button type="submit" class="btn btn-primary" style="width:100%;background:#10b981;">
-                            <i class="fas fa-plus" aria-hidden="true"></i> Tambah ke Keranjang ${target.basketNum}
-                        </button>
+                        <button type="submit" class="btn btn-primary" style="width:100%;background:#10b981;"
+        onclick="if(state.isSaving) return showToast('⏳ Sedang menyimpan...', 'warning')">
+  <i class="fas fa-plus" aria-hidden="true"></i> Tambah ke Keranjang ${target.basketNum}
+</button>
                     </form>
                 </div>
             `;
@@ -2251,7 +2312,9 @@ function saveEstDate(basketNum, itemIdx) {
                             <small>Isi jika slot kosong</small>
                             <small id="keranjangWarning" style="display:block;margin-top:4px;" role="status"></small>
                         </div>
-                        <button type="submit" class="btn btn-primary" style="width:100%">💾 Simpan</button>
+                        <button type="submit" class="btn btn-primary" 
+        onclick="if(state.isSaving) return showToast('⏳ Sedang menyimpan...', 'warning')"
+        style="width:100%">💾 Simpan</button>
                     </form>
                 </div>
             `;
